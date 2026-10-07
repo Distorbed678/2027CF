@@ -4,13 +4,21 @@
 
 package frc.robot;
 
-import frc.robot.Constants.OperatorConstants;
-import frc.robot.commands.Autos;
-import frc.robot.commands.ExampleCommand;
-import frc.robot.subsystems.ExampleSubsystem;
+import com.ctre.phoenix6.swerve.SwerveModule.DriveRequestType;
+import com.ctre.phoenix6.swerve.SwerveRequest;
+import com.pathplanner.lib.auto.AutoBuilder;
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.wpilibj.smartdashboard.SendableChooser;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
-import edu.wpi.first.wpilibj2.command.button.Trigger;
+import edu.wpi.first.wpilibj2.command.button.RobotModeTriggers;
+import frc.robot.Constants.DriveConstants;
+import frc.robot.Constants.OperatorConstants;
+import frc.robot.generated.TunerConstants;
+import frc.robot.subsystems.CommandSwerveDrivetrain;
+import frc.robot.subsystems.Vision;
 
 /**
  * This class is where the bulk of the robot should be declared. Since Command-based is a
@@ -20,35 +28,94 @@ import edu.wpi.first.wpilibj2.command.button.Trigger;
  */
 public class RobotContainer {
   // The robot's subsystems and commands are defined here...
-  private final ExampleSubsystem m_exampleSubsystem = new ExampleSubsystem();
+  private final CommandSwerveDrivetrain m_drivetrain = TunerConstants.createDrivetrain();
+  private final Vision m_vision = new Vision(m_drivetrain);
+  private final Telemetry m_telemetry = new Telemetry();
 
-  // Replace with CommandPS4Controller or CommandJoystick if needed
   private final CommandXboxController m_driverController =
       new CommandXboxController(OperatorConstants.kDriverControllerPort);
 
+  /* Swerve requests */
+  private final SwerveRequest.FieldCentric m_fieldCentricDrive =
+      new SwerveRequest.FieldCentric().withDriveRequestType(DriveRequestType.OpenLoopVoltage);
+  private final SwerveRequest.SwerveDriveBrake m_brake = new SwerveRequest.SwerveDriveBrake();
+  private final SwerveRequest.Idle m_idle = new SwerveRequest.Idle();
+
+  private final SendableChooser<Command> m_autoChooser;
+
   /** The container for the robot. Contains subsystems, OI devices, and commands. */
   public RobotContainer() {
-    // Configure the trigger bindings
+    registerNamedCommands();
+
+    if (AutoBuilder.isConfigured()) {
+      m_autoChooser = AutoBuilder.buildAutoChooser();
+    } else {
+      // PathPlanner robot config is missing; see CommandSwerveDrivetrain#configureAutoBuilder.
+      m_autoChooser = new SendableChooser<>();
+      m_autoChooser.setDefaultOption("None (configure PathPlanner)", Commands.none());
+    }
+    SmartDashboard.putData("Auto Chooser", m_autoChooser);
+
     configureBindings();
+    m_drivetrain.registerTelemetry(m_telemetry::telemeterize);
   }
 
   /**
-   * Use this method to define your trigger->command mappings. Triggers can be created via the
-   * {@link Trigger#Trigger(java.util.function.BooleanSupplier)} constructor with an arbitrary
-   * predicate, or via the named factories in {@link
-   * edu.wpi.first.wpilibj2.command.button.CommandGenericHID}'s subclasses for {@link
-   * CommandXboxController Xbox}/{@link edu.wpi.first.wpilibj2.command.button.CommandPS4Controller
-   * PS4} controllers or {@link edu.wpi.first.wpilibj2.command.button.CommandJoystick Flight
-   * joysticks}.
+   * Register commands that PathPlanner autos can trigger by name (event markers / named commands).
+   * Must run before the auto chooser is built.
    */
-  private void configureBindings() {
-    // Schedule `ExampleCommand` when `exampleCondition` changes to `true`
-    new Trigger(m_exampleSubsystem::exampleCondition)
-        .onTrue(new ExampleCommand(m_exampleSubsystem));
+  private void registerNamedCommands() {
+    // Example: NamedCommands.registerCommand("Intake", m_intake.intakeCommand());
+  }
 
-    // Schedule `exampleMethodCommand` when the Xbox controller's B button is pressed,
-    // cancelling on release.
-    m_driverController.b().whileTrue(m_exampleSubsystem.exampleMethodCommand());
+  private void configureBindings() {
+    // Field-centric drive: left stick translates, right stick X rotates.
+    // Note that X is defined as forward according to WPILib convention,
+    // and Y is defined as to the left according to WPILib convention.
+    m_drivetrain.setDefaultCommand(
+        m_drivetrain.applyRequest(
+            () -> {
+              double scale =
+                  m_driverController.rightBumper().getAsBoolean()
+                      ? DriveConstants.kSlowModeScale
+                      : 1.0;
+              return m_fieldCentricDrive
+                  .withVelocityX(
+                      shapeInput(-m_driverController.getLeftY()) * DriveConstants.kMaxSpeed * scale)
+                  .withVelocityY(
+                      shapeInput(-m_driverController.getLeftX()) * DriveConstants.kMaxSpeed * scale)
+                  .withRotationalRate(
+                      shapeInput(-m_driverController.getRightX())
+                          * DriveConstants.kMaxAngularRate
+                          * scale);
+            }));
+
+    // Idle while the robot is disabled. This ensures the configured
+    // neutral mode is applied to the drive motors while disabled.
+    RobotModeTriggers.disabled()
+        .whileTrue(m_drivetrain.applyRequest(() -> m_idle).ignoringDisable(true));
+
+    // X: lock wheels in an X pattern to resist being pushed.
+    m_driverController.x().whileTrue(m_drivetrain.applyRequest(() -> m_brake));
+
+    // Start: re-zero field heading. Point the robot away from your driver station first.
+    m_driverController
+        .start()
+        .onTrue(m_drivetrain.runOnce(m_drivetrain::seedFieldCentric).ignoringDisable(true));
+
+    // Back: snap the pose (position and heading) to the latest multi-tag vision estimate.
+    m_driverController
+        .back()
+        .onTrue(
+            Commands.runOnce(
+                    () -> m_vision.getRecentMultiTagPose().ifPresent(m_drivetrain::resetPose))
+                .ignoringDisable(true));
+  }
+
+  /** Applies deadband and squares the input (keeping sign) for finer low-speed control. */
+  private static double shapeInput(double value) {
+    value = MathUtil.applyDeadband(value, OperatorConstants.kDeadband);
+    return Math.copySign(value * value, value);
   }
 
   /**
@@ -57,7 +124,6 @@ public class RobotContainer {
    * @return the command to run in autonomous
    */
   public Command getAutonomousCommand() {
-    // An example command will be run in autonomous
-    return Autos.exampleAuto(m_exampleSubsystem);
+    return m_autoChooser.getSelected();
   }
 }
